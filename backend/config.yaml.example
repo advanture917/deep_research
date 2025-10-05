@@ -1,0 +1,36 @@
+# Deep Research Configuration
+
+# LLM Configuration
+llm:
+  # OpenAI Configuration
+  openai:
+    base_url: "your_openai_url"
+    api_key:  ""
+    model:  ""
+
+# # Database Configuration
+# database:
+#   type: "sqlite"  # sqlite, postgresql, mysql
+#   connection_string: "sqlite:///deep_research.db"
+  
+# # API Configuration
+# api:
+#   host: "0.0.0.0"
+#   port: 8000
+#   debug: false
+  
+# Research Configuration
+search:
+  search_api: "tavily"
+  tavily_api_key: ""
+  max_iterations: 10
+  max_depth: 3
+  concurrent_requests: 5
+  min_score_threshold: 0.3
+  max_content_length_per_page: 2000
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/deep_research.log"
