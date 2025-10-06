@@ -10,7 +10,8 @@ def _create_chat_model(config: dict) -> BaseChatModel:
         return init_chat_model(model=config["llm"]["openai"]["model"],
                                model_provider=model_provider,
                                base_url=config["llm"]["openai"]["base_url"],
-                               api_key=config["llm"]["openai"]["api_key"])
+                               api_key=config["llm"]["openai"]["api_key"],
+                               max_tokens=config["llm"]["openai"]["max_tokens"])  # 限制输出长度避免超出限制
     else:
         raise ValueError("LLM type not supported")
 
