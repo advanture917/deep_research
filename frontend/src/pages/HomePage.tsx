@@ -1,71 +1,163 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { useResearch } from '../context/ResearchContext';
-import { ArrowRight, Sparkles, Brain, Target } from 'lucide-react';
+import { Sparkles, Brain, Radio, FileText } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeRaw from 'rehype-raw';
 import { useNavigate } from 'react-router-dom';
+import ChatInterface from '../components/ChatInterface';
+import { useResearchStream } from '../hooks/useResearchStream';
+import { startResearch } from '../services/researchService';
 
 const HomePage: React.FC = () => {
-  const { dispatch } = useResearch();
-  const [inputValue, setInputValue] = useState('');
+  const { state, dispatch } = useResearch();
   const [isLoading, setIsLoading] = useState(false);
+  const [currentPlanId, setCurrentPlanId] = useState<string | null>(null);
   const navigate = useNavigate();
+  
+  // 使用研究流Hook
+  const { state: streamState, isLoading: streamLoading, error: streamError, isConnected } = useResearchStream(currentPlanId);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputValue.trim()) return;
+  // 处理发送消息 - 使用LangGraph实时流
+  const handleSendMessage = async (message: string) => {
+    if (!message.trim()) return;
 
     setIsLoading(true);
     
+    // 添加用户消息
+    dispatch({
+      type: 'ADD_MESSAGE',
+      payload: {
+        id: Date.now().toString(),
+        role: 'user',
+        content: message,
+        timestamp: new Date(),
+      },
+    });
+
     try {
-      // 调用后端API创建研究计划
-      const response = await fetch('http://localhost:8000/api/research/create-plan', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+      // 使用研究服务开始研究流程
+      const result = await startResearch(message, 'zh-CN');
+      
+      // 只有当问题需要研究计划时才启动实时流轮询
+      if (result.need_plan) {
+        setCurrentPlanId(result.plan_id || null);
+      }
+      
+      // 更新研究上下文状态
+      dispatch({
+        type: 'UPDATE_FROM_BACKEND',
+        payload: {
+          researchTopic: message,
+          planId: result.plan_id,
+          status: result.status,
+          currentStage: result.current_stage,
+          needPlan: result.need_plan,
+          researchSummary: result.research_summary,
+          stepResults: result.step_results || [],
         },
-        body: JSON.stringify({ topic: inputValue }),
       });
 
-      if (response.ok) {
-        const plan = await response.json();
-        
-        // 设置研究主题和计划
-        dispatch({ type: 'SET_TOPIC', payload: inputValue });
-        dispatch({ type: 'SET_PLAN', payload: plan });
-        
-        // 添加用户消息
+      // 添加AI初始回复
+      dispatch({
+        type: 'ADD_MESSAGE',
+        payload: {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: typeof result.messages === 'string' ? result.messages : `好的！我已经开始为您研究关于"${message}"的相关内容。`,
+          timestamp: new Date(),
+        },
+      });
+
+    } catch (error) {
+      console.error('开始研究失败:', error);
+      
+      // 添加错误消息
+      dispatch({
+        type: 'ADD_MESSAGE',
+        payload: {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: '抱歉，处理您的请求时出现了问题。请稍后重试。',
+          timestamp: new Date(),
+        },
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // 监听实时流状态变化
+  useEffect(() => {
+    if (streamState) {
+      // 添加调试日志
+      console.log('🔄 实时流状态更新:', {
+        status: streamState.status,
+        need_plan: streamState.need_plan,
+        current_stage: streamState.current_stage,
+        has_plan: !!streamState.current_plan,
+        messages: streamState.messages
+      });
+
+      // 如果后端返回了消息内容，添加到消息列表
+      if (streamState.messages && typeof streamState.messages === 'string') {
         dispatch({
           type: 'ADD_MESSAGE',
           payload: {
             id: Date.now().toString(),
-            role: 'user',
-            content: inputValue,
-            timestamp: new Date(),
-          },
-        });
-
-        // 添加AI回复
-        dispatch({
-          type: 'ADD_MESSAGE',
-          payload: {
-            id: (Date.now() + 1).toString(),
             role: 'assistant',
-            content: `好的！我已经为您制定了关于"${inputValue}"的研究计划，包含${plan.steps.length}个研究步骤。`,
+            content: streamState.messages,
             timestamp: new Date(),
           },
         });
-
-        setIsLoading(false);
-        navigate('/plan');
-      } else {
-        throw new Error('创建研究计划失败');
       }
-    } catch (error) {
-      console.error('创建研究计划失败:', error);
-      setIsLoading(false);
-      alert('创建研究计划失败，请稍后重试');
+      
+      // 更新研究上下文状态
+      dispatch({
+        type: 'UPDATE_FROM_BACKEND',
+        payload: {
+          status: streamState.status,
+          currentStage: streamState.current_stage,
+          needPlan: streamState.need_plan,
+          currentPlan: streamState.current_plan,
+          researchSummary: streamState.research_summary,
+          stepResults: streamState.step_results || [],
+        },
+      });
+
+      // 根据状态变化处理导航 - 添加更详细的条件判断
+      const shouldNavigateToPlan = streamState.need_plan && 
+        (streamState.status === 'awaiting_confirmation' || streamState.status === 'plan_generated');
+      
+      console.log('🧭 导航判断:', {
+        shouldNavigateToPlan,
+        condition1: streamState.need_plan,
+        condition2: streamState.status === 'awaiting_confirmation' || streamState.status === 'plan_generated',
+        status: streamState.status
+      });
+
+      if (shouldNavigateToPlan) {
+        console.log('🚀 导航到计划页面');
+        // 需要用户确认计划，导航到计划页面并停止轮询
+        setCurrentPlanId(null); // 停止实时流轮询，让计划页面处理后续交互
+        navigate('/plan');
+      } else if (streamState.status === 'completed') {
+        console.log('🚀 导航到报告页面');
+        // 研究完成，导航到报告页面并停止实时流轮询
+        setCurrentPlanId(null); // 停止实时流轮询
+        navigate('/report');
+      }
     }
-  };
+  }, [streamState, dispatch, navigate]);
+
+  // 监听流错误
+  useEffect(() => {
+    if (streamError) {
+      console.error('研究流错误:', streamError);
+      // 可以在这里添加错误处理逻辑
+    }
+  }, [streamError]);
 
   const sampleQuestions = [
     "2025年token2049大会有哪些重要议题和演讲？",
@@ -74,105 +166,182 @@ const HomePage: React.FC = () => {
     "可持续能源技术的投资热点分析",
   ];
 
+  // 过滤掉system角色的消息，只显示user和assistant角色的消息，并进行类型转换
+  const filteredMessages = state.messages
+    .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+    .map(msg => ({
+      id: msg.id,
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+      timestamp: msg.timestamp
+    }));
+  
+  // 组合加载状态
+  const combinedIsLoading = isLoading || streamLoading;
+
+  // 生成研究报告
+  const generateReport = () => {
+    if (state.status === 'completed' && state.researchSummary && state.stepResults) {
+      const reportContent = `# 关于"${state.researchTopic}"的研究报告
+
+## 研究概述
+
+${state.stepResults?.map((step: any, index: number) => `### ${index + 1}. ${step.title || `步骤${index + 1}`}
+${step.content || step.result || '暂无详细内容'}
+`).join('\n') || '暂无详细研究过程信息。'}
+
+## 结论
+本研究基于系统性的调研和分析，提供了对"${state.researchTopic}"的深入理解。`;
+
+      return {
+        title: `关于"${state.researchTopic}"的研究报告`,
+        content: reportContent,
+        steps: state.stepResults || [],
+        created_at: new Date().toISOString(),
+      };
+    }
+    return null;
+  };
+
+  const report = generateReport();
+  
   return (
-    <div className="max-w-4xl mx-auto">
-      {/* Hero Section */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6 }}
-        className="text-center mb-12"
-      >
-        <div className="flex justify-center mb-6">
-          <motion.div
-            animate={{ rotate: [0, 10, -10, 0] }}
-            transition={{ duration: 2, repeat: Infinity, repeatType: "reverse" }}
-          >
-            <Brain className="h-16 w-16 text-primary-500 mx-auto" />
-          </motion.div>
-        </div>
-        <h1 className="text-4xl md:text-6xl font-bold text-gray-900 mb-4">
-          AI驱动的
-          <span className="text-gradient">深度研究</span>
-        </h1>
-        <p className="text-xl text-gray-600 mb-8 max-w-2xl mx-auto">
-          智能分析、深度挖掘、专业报告 - 让AI成为您的研究助手
-        </p>
-      </motion.div>
-
-      {/* Input Section */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, delay: 0.2 }}
-        className="bg-white/80 backdrop-blur-sm rounded-2xl p-8 card-shadow mb-8"
-      >
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div>
-            <label htmlFor="research-topic" className="block text-lg font-medium text-gray-700 mb-3">
-              请输入您想要研究的主题或问题
-            </label>
-            <textarea
-              id="research-topic"
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              placeholder="例如：2025年token2049大会有哪些重要议题和演讲？"
-              className="input-field min-h-[120px] text-lg"
-              disabled={isLoading}
-            />
-          </div>
-          
-          <motion.button
-            type="submit"
-            disabled={isLoading || !inputValue.trim()}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            className={`w-full py-4 px-6 rounded-xl font-semibold text-lg transition-all duration-200 ${
-              isLoading || !inputValue.trim()
-                ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                : 'btn-primary'
-            }`}
-          >
-            {isLoading ? (
-              <div className="flex items-center justify-center space-x-2">
-                <div className="loading-spinner"></div>
-                <span>正在分析...</span>
-              </div>
-            ) : (
-              <div className="flex items-center justify-center space-x-2">
-                <Sparkles className="h-5 w-5" />
-                <span>开始深度研究</span>
-              </div>
+    <div className="h-screen flex flex-col">
+      {/* 实时流状态栏 */}
+      <div className="bg-gray-50 border-b border-gray-200 px-4 py-2">
+        <div className="flex items-center justify-between text-sm">
+          <div className="flex items-center space-x-2">
+            <Radio className={`h-3 w-3 ${isConnected ? 'text-green-500' : 'text-gray-400'}`} />
+            <span className="text-gray-600">
+              LangGraph实时流: {isConnected ? '已连接' : '待连接'}
+            </span>
+            {streamState && (
+              <span className="text-gray-500">
+                | 状态: {streamState.status} | 阶段: {streamState.current_stage || '等待中'}
+              </span>
             )}
-          </motion.button>
-        </form>
-      </motion.div>
-
-      {/* Sample Questions */}
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6, delay: 0.4 }}
-        className="bg-white/60 backdrop-blur-sm rounded-xl p-6"
-      >
-        <h3 className="text-lg font-semibold text-gray-800 mb-4 flex items-center">
-          <Sparkles className="h-5 w-5 text-accent-500 mr-2" />
-          热门研究主题
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {sampleQuestions.map((question, index) => (
-            <motion.button
-              key={index}
-              onClick={() => setInputValue(question)}
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-              className="text-left p-4 bg-gray-50 hover:bg-primary-50 rounded-lg border border-gray-200 hover:border-primary-200 transition-all duration-200 text-sm text-gray-700 hover:text-primary-700"
-            >
-              {question}
-            </motion.button>
-          ))}
+          </div>
+          {currentPlanId && (
+            <span className="text-gray-400 text-xs">计划ID: {currentPlanId}</span>
+          )}
         </div>
-      </motion.div>
+      </div>
+
+      <div className="flex-1 flex flex-col overflow-hidden">
+      
+      {/* 欢迎区域 - 仅在消息为空时显示 */}
+      {state.messages.length === 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+          className="text-center py-8"
+        >
+          <div className="flex justify-center mb-4">
+            <motion.div
+              animate={{ rotate: [0, 10, -10, 0] }}
+              transition={{ duration: 2, repeat: Infinity, repeatType: "reverse" }}
+            >
+              <Brain className="h-12 w-12 text-primary-500 mx-auto" />
+            </motion.div>
+          </div>
+          <h1 className="text-2xl md:text-4xl font-bold text-gray-900 mb-2">
+            AI驱动的
+            <span className="text-gradient">深度研究</span>
+          </h1>
+          <p className="text-lg text-gray-600 mb-6 max-w-2xl mx-auto">
+            智能分析、深度挖掘、专业报告 - 让AI成为您的研究助手
+          </p>
+          
+          {/* Sample Questions */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.4 }}
+            className="bg-white/60 backdrop-blur-sm rounded-xl p-4 mx-4 mb-4"
+          >
+            <h3 className="text-md font-semibold text-gray-800 mb-3 flex items-center justify-center">
+              <Sparkles className="h-4 w-4 text-accent-500 mr-2" />
+              热门研究主题
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {sampleQuestions.map((question, index) => (
+                <motion.button
+                  key={index}
+                  onClick={() => handleSendMessage(question)}
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  className="text-left p-3 bg-gray-50 hover:bg-primary-50 rounded-lg border border-gray-200 hover:border-primary-200 transition-all duration-200 text-sm text-gray-700 hover:text-primary-700"
+                >
+                  {question}
+                </motion.button>
+              ))}
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+      
+        {/* 聊天界面 - 始终显示 */}
+        <div className="flex-1 overflow-hidden">
+          <ChatInterface
+            messages={filteredMessages}
+            onSendMessage={handleSendMessage}
+            isLoading={combinedIsLoading}
+            placeholder="请输入您的问题或研究主题..."
+          />
+        </div>
+
+        {/* 研究报告展示区域 - 当研究完成时显示 */}
+        {report && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6 }}
+            className="bg-white border-t border-gray-200 max-h-80 overflow-y-auto flex-shrink-0"
+          >
+            <div className="max-w-4xl mx-auto p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center space-x-2">
+                  <FileText className="h-5 w-5 text-primary-500" />
+                  <h3 className="text-lg font-semibold text-gray-800">研究报告</h3>
+                </div>
+                <button
+                  onClick={() => navigate('/report')}
+                  className="text-sm text-primary-600 hover:text-primary-700 underline"
+                >
+                  查看完整报告 →
+                </button>
+              </div>
+              
+              <div className="prose prose-sm max-w-none bg-gray-50 rounded-lg p-4 max-h-48 overflow-y-auto">
+                <ReactMarkdown 
+                  remarkPlugins={[remarkGfm]}
+                  rehypePlugins={[rehypeRaw]}
+                  components={{
+                    h1: ({ children }) => <h1 className="text-xl font-bold text-gray-900 mb-3">{children}</h1>,
+                    h2: ({ children }) => <h2 className="text-lg font-bold text-gray-800 mb-2 mt-4">{children}</h2>,
+                    h3: ({ children }) => <h3 className="text-base font-semibold text-gray-800 mb-2 mt-3">{children}</h3>,
+                    p: ({ children }) => <p className="text-gray-700 leading-relaxed mb-2 text-sm">{children}</p>,
+                    ul: ({ children }) => <ul className="list-disc list-inside text-gray-700 mb-2 space-y-1 text-sm">{children}</ul>,
+                    ol: ({ children }) => <ol className="list-decimal list-inside text-gray-700 mb-2 space-y-1 text-sm">{children}</ol>,
+                    li: ({ children }) => <li className="text-gray-700 text-sm">{children}</li>,
+                    blockquote: ({ children }) => <blockquote className="border-l-3 border-primary-400 pl-3 italic text-gray-600 my-2 text-sm">{children}</blockquote>,
+                    code: ({ children, ...props }) => 
+                      props.className?.includes('language') ? 
+                        <code className="block bg-gray-100 p-2 rounded text-xs font-mono overflow-x-auto my-2">{children}</code> :
+                        <code className="bg-gray-100 px-1 py-0.5 rounded text-xs font-mono">{children}</code>,
+                    pre: ({ children }) => <pre className="bg-gray-100 p-2 rounded overflow-x-auto my-2 text-xs">{children}</pre>,
+                    strong: ({ children }) => <strong className="font-bold text-gray-900">{children}</strong>,
+                    em: ({ children }) => <em className="italic text-gray-700">{children}</em>,
+                  }}
+                >
+                  {report.content}
+                </ReactMarkdown>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </div>
     </div>
   );
 };

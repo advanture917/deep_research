@@ -3,91 +3,95 @@ import { motion } from 'framer-motion';
 import { useResearch, ResearchPlan } from '../context/ResearchContext';
 import { Check, Edit3, X, ArrowRight, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { confirmPlan } from '../services/researchService';
 
 const PlanPage: React.FC = () => {
   const { state, dispatch } = useResearch();
   const [isEditing, setIsEditing] = useState(false);
   const [editedPlan, setEditedPlan] = useState<ResearchPlan | null>(state.currentPlan);
   const [isLoading, setIsLoading] = useState(false);
+  const [modifyMessage, setModifyMessage] = useState('');
   const navigate = useNavigate();
 
-  // 模拟生成研究计划
+  // 监听状态变化，当研究完成时导航到报告页面
   React.useEffect(() => {
-    if (!state.currentPlan && state.researchTopic) {
-      const mockPlan = {
-        id: `mock-${Date.now()}`,
-        title: `关于"${state.researchTopic}"的深度研究计划`,
-        thought: "基于当前主题，我制定了一个全面的研究计划，将从多个角度进行深入分析。",
-        steps: [
-          {
-            title: "背景调研",
-            description: "搜集相关背景信息，了解当前领域的最新发展状况",
-            status: 'pending' as const,
-          },
-          {
-            title: "关键问题分析",
-            description: "识别和分析核心问题，确定研究的重点方向",
-            status: 'pending' as const,
-          },
-          {
-            title: "数据收集与验证",
-            description: "收集相关数据和信息，进行事实核查和验证",
-            status: 'pending' as const,
-          },
-          {
-            title: "深度分析与综合",
-            description: "对收集的信息进行深度分析，形成综合性结论",
-            status: 'pending' as const,
-          },
-          {
-            title: "报告生成",
-            description: "基于研究结果生成专业的研究报告",
-            status: 'pending' as const,
-          },
-        ],
-      };
-      dispatch({ type: 'SET_PLAN', payload: mockPlan });
-      setEditedPlan(mockPlan);
+    if (state.status === 'completed') {
+      navigate('/report');
     }
-  }, [state.researchTopic, state.currentPlan, dispatch]);
+  }, [state.status, navigate]);
+
+  // 从后端状态中获取计划信息
+  React.useEffect(() => {
+    console.log('PlanPage - 当前状态:', {
+      status: state.status,
+      currentPlan: state.currentPlan,
+      planId: state.planId,
+      needPlan: state.needPlan
+    });
+    
+    if (state.currentPlan && state.currentPlan.steps) {
+      // 如果已经有计划，直接使用
+      setEditedPlan(state.currentPlan);
+    } else if (state.currentPlan) {
+      // 从后端状态中创建计划
+      const backendPlan = state.currentPlan;
+      const plan: ResearchPlan = {
+        id: state.planId || `plan-${Date.now()}`,
+        title: `关于"${state.researchTopic}"的研究计划`,
+        thought: backendPlan.thought || "基于当前主题，我制定了一个全面的研究计划。",
+        steps: backendPlan.steps?.map((step: any, index: number) => ({
+          title: step.title || `步骤 ${index + 1}`,
+          description: step.description || "",
+          status: 'pending' as const,
+        })) || [],
+      };
+      dispatch({ type: 'SET_PLAN', payload: plan });
+      setEditedPlan(plan);
+    }
+  }, [state.currentPlan, state.researchTopic, state.planId, dispatch]);
 
   const handleConfirmPlan = async () => {
     setIsLoading(true);
     
     try {
-      // 更新计划到后端
-      if (editedPlan && state.currentPlan) {
-        const response = await fetch(`http://localhost:8000/api/research/update-plan/${state.currentPlan.id}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(editedPlan),
-        });
-
-        if (response.ok) {
-          const updatedPlan = await response.json();
-          dispatch({ type: 'SET_PLAN', payload: updatedPlan });
-          
-          // 开始研究
-          const startResponse = await fetch(`http://localhost:8000/api/research/start/${state.currentPlan.id}`, {
-            method: 'POST',
-          });
-
-          if (startResponse.ok) {
-            setIsLoading(false);
-            navigate('/progress');
-          } else {
-            throw new Error('开始研究失败');
-          }
-        } else {
-          throw new Error('更新计划失败');
-        }
+      if (!state.planId) {
+        throw new Error('计划ID不存在');
       }
+
+      // 使用研究服务确认计划
+      const result = await confirmPlan(state.planId, 'confirm');
+      
+      // 更新状态
+      dispatch({
+        type: 'UPDATE_FROM_BACKEND',
+        payload: {
+          status: result.status,
+          currentStage: result.current_stage,
+          needPlan: result.need_plan,
+          researchSummary: result.research_summary,
+          stepResults: result.step_results || [],
+          currentPlan: result.current_plan || state.currentPlan,
+        },
+      });
+
+      // 添加确认消息
+      dispatch({
+        type: 'ADD_MESSAGE',
+        payload: {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: '研究计划已确认，开始执行研究流程...',
+          timestamp: new Date(),
+        },
+      });
+
+      // 导航到进度页面
+      navigate('/progress');
     } catch (error) {
       console.error('确认计划失败:', error);
-      setIsLoading(false);
       alert('确认计划失败，请稍后重试');
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -106,43 +110,50 @@ const PlanPage: React.FC = () => {
     });
   };
 
-  const handleRegeneratePlan = () => {
-    // 模拟重新生成计划
-    if (state.researchTopic) {
-      const newMockPlan = {
-        id: `mock-${Date.now()}`,
-        title: `关于"${state.researchTopic}"的优化研究计划`,
-        thought: "基于反馈重新制定的研究计划，更加聚焦核心问题。",
-        steps: [
-          {
-            title: "问题定义与范围界定",
-            description: "明确研究问题的边界和核心要素",
-            status: 'pending' as const,
-          },
-          {
-            title: "文献综述",
-            description: "系统梳理相关研究和理论基础",
-            status: 'pending' as const,
-          },
-          {
-            title: "实证研究",
-            description: "基于实际数据和案例进行深入研究",
-            status: 'pending' as const,
-          },
-          {
-            title: "结果分析与讨论",
-            description: "分析研究结果，探讨其意义和影响",
-            status: 'pending' as const,
-          },
-          {
-            title: "结论与建议",
-            description: "形成研究结论，提出相关建议",
-            status: 'pending' as const,
-          },
-        ],
-      };
-      dispatch({ type: 'SET_PLAN', payload: newMockPlan });
-      setEditedPlan(newMockPlan);
+  const handleModifyPlan = async () => {
+    if (!state.planId || !modifyMessage.trim()) {
+      alert('请输入修改意见');
+      return;
+    }
+
+    setIsLoading(true);
+    
+    try {
+      // 使用研究服务修改计划
+      const result = await confirmPlan(state.planId, 'modify', modifyMessage);
+      
+      // 更新状态
+      dispatch({
+        type: 'UPDATE_FROM_BACKEND',
+        payload: {
+          status: result.status,
+          currentStage: result.current_stage,
+          needPlan: result.need_plan,
+          currentPlan: result.current_plan,
+          researchSummary: result.research_summary,
+          stepResults: result.step_results || [],
+        },
+      });
+
+      // 添加修改消息
+      dispatch({
+        type: 'ADD_MESSAGE',
+        payload: {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: '已收到您的修改意见，正在重新生成研究计划...',
+          timestamp: new Date(),
+        },
+      });
+
+      // 重置修改消息
+      setModifyMessage('');
+      setIsEditing(false);
+    } catch (error) {
+      console.error('修改计划失败:', error);
+      alert('修改计划失败，请稍后重试');
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -171,13 +182,6 @@ const PlanPage: React.FC = () => {
         <div className="flex items-center justify-between mb-6">
           <h1 className="text-3xl font-bold text-gray-900">研究计划</h1>
           <div className="flex space-x-3">
-            <button
-              onClick={handleRegeneratePlan}
-              className="flex items-center space-x-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition-all duration-200 text-gray-700"
-            >
-              <RefreshCw className="h-4 w-4" />
-              <span>重新生成</span>
-            </button>
             <button
               onClick={() => setIsEditing(!isEditing)}
               className={`flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-200 ${
@@ -239,7 +243,45 @@ const PlanPage: React.FC = () => {
           ))}
         </div>
 
-        <div className="mt-8 flex justify-end">
+        {/* 修改计划界面 */}
+        {isEditing && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            className="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg"
+          >
+            <h4 className="text-lg font-semibold text-yellow-800 mb-3">修改研究计划</h4>
+            <textarea
+              value={modifyMessage}
+              onChange={(e) => setModifyMessage(e.target.value)}
+              placeholder="请描述您希望如何修改研究计划..."
+              className="w-full p-3 border border-yellow-300 rounded-lg focus:ring-2 focus:ring-yellow-500 focus:border-transparent resize-none min-h-[100px]"
+            />
+            <div className="flex justify-end space-x-3 mt-3">
+              <button
+                onClick={() => setIsEditing(false)}
+                className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleModifyPlan}
+                disabled={!modifyMessage.trim() || isLoading}
+                className="px-4 py-2 bg-yellow-500 text-white rounded-lg hover:bg-yellow-600 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+              >
+                {isLoading ? '提交中...' : '提交修改'}
+              </button>
+            </div>
+          </motion.div>
+        )}
+
+        <div className="mt-8 flex justify-end space-x-3">
+          <button
+            onClick={() => navigate('/')}
+            className="px-6 py-3 bg-gray-200 text-gray-700 rounded-xl font-semibold hover:bg-gray-300 transition-colors"
+          >
+            返回聊天
+          </button>
           <button
             onClick={handleConfirmPlan}
             disabled={isLoading}

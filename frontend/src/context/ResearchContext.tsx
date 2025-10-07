@@ -11,6 +11,14 @@ export interface ResearchState {
   researchResults: ResearchResult[];
   researchLoopCount: number;
   maxResearchLoops: number;
+  planId: string | null;
+  status: 'pending' | 'coordinate' | 'plan_generated' | 'awaiting_confirmation' | 'research_completed' | 'completed';
+  currentStage: string | null;
+  researchSummary: string | null;
+  stepResults: any[];
+  needPlan: boolean;
+  message?: string; // 后端返回的消息字段
+  error?: string; // 后端返回的错误字段
 }
 
 export interface ResearchPlan {
@@ -58,6 +66,12 @@ const initialState: ResearchState = {
   researchResults: [],
   researchLoopCount: 0,
   maxResearchLoops: 3,
+  planId: null,
+  status: 'pending',
+  currentStage: null,
+  researchSummary: null,
+  stepResults: [],
+  needPlan: false,
 };
 
 // Action类型
@@ -71,7 +85,14 @@ type ResearchAction =
   | { type: 'UPDATE_STEP_STATUS'; payload: { stepIndex: number; status: ResearchStep['status']; result?: string } }
   | { type: 'ADD_RESEARCH_RESULT'; payload: ResearchResult }
   | { type: 'SET_RESEARCH_LOOP_COUNT'; payload: number }
-  | { type: 'RESET_RESEARCH' };
+  | { type: 'RESET_RESEARCH' }
+  | { type: 'SET_PLAN_ID'; payload: string }
+  | { type: 'SET_STATUS'; payload: ResearchState['status'] }
+  | { type: 'SET_CURRENT_STAGE'; payload: string | null }
+  | { type: 'SET_RESEARCH_SUMMARY'; payload: string | null }
+  | { type: 'SET_STEP_RESULTS'; payload: any[] }
+  | { type: 'SET_NEED_PLAN'; payload: boolean }
+  | { type: 'UPDATE_FROM_BACKEND'; payload: Partial<ResearchState> };
 
 // Reducer函数
 const researchReducer = (state: ResearchState, action: ResearchAction): ResearchState => {
@@ -110,6 +131,20 @@ const researchReducer = (state: ResearchState, action: ResearchAction): Research
       };
     case 'SET_RESEARCH_LOOP_COUNT':
       return { ...state, researchLoopCount: action.payload };
+    case 'SET_PLAN_ID':
+      return { ...state, planId: action.payload };
+    case 'SET_STATUS':
+      return { ...state, status: action.payload };
+    case 'SET_CURRENT_STAGE':
+      return { ...state, currentStage: action.payload };
+    case 'SET_RESEARCH_SUMMARY':
+      return { ...state, researchSummary: action.payload };
+    case 'SET_STEP_RESULTS':
+      return { ...state, stepResults: action.payload };
+    case 'SET_NEED_PLAN':
+      return { ...state, needPlan: action.payload };
+    case 'UPDATE_FROM_BACKEND':
+      return { ...state, ...action.payload };
     case 'RESET_RESEARCH':
       return initialState;
     default:
