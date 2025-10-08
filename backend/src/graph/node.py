@@ -270,7 +270,7 @@ def research_node(state: State) -> Command:
     research_summary += f"## 背景与研究动机\n{state['current_plan'].thought}\n\n"
 
     for idx, section in enumerate(research_summary_parts, start=1):
-        research_summary += f"## 步骤 {idx}\n{section}\n\n"
+        research_summary += f"## {section}\n\n"
 
     research_summary += f"---\n研究完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
 
@@ -302,11 +302,14 @@ graph_build.add_edge("generate_plan", "human_feedback")
 graph_build.add_edge("human_feedback", "research_node")
 graph_build.add_edge("research_node", END)
 graph_build.add_edge("coordinate", END)
+# 正常启动
+from langgraph.checkpoint.memory import InMemorySaver
+checkpointer = InMemorySaver() 
+graph = graph_build.compile(checkpointer=checkpointer)
 
-# 编译图 - LangGraph API 会自动处理持久化，不需要自定义检查点
-graph = graph_build.compile()
-
-def test_research_flow(research_topic: str = "你是谁", locale: str = "zh-CN"):
+# 通过 langgraph dev 启动 ，langgraph API 会自动处理持久化，不需要自定义检查点
+# graph = graph_build.compile()
+def test_research_flow(research_topic: str = "2025 年 token2049大会的内容和愿景", locale: str = "zh-CN"):
     """
     测试完整的研究流程
     
@@ -351,7 +354,11 @@ def test_research_flow(research_topic: str = "你是谁", locale: str = "zh-CN")
             stage_name = list(result.keys())[0]
             results["stages"].append(stage_name)
             print(f"✅ {stage_name}")   
-        
+        for chunk in graph.stream(Command(resume={
+                    "user_confirm": "confirm",
+                    # "message": 
+                }), config):
+            print(chunk)
     except Exception as e:
         print(f"\n❌ 测试失败: {e}")
         results["error"] = str(e)
