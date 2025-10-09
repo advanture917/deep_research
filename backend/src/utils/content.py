@@ -118,7 +118,7 @@ class ContextManager:
         # 检查是否需要压缩
         if not self.is_over_limit(messages):
             return messages
-        
+        logger.info(f"上下文超出token限制，当前token长度: {self.count_tokens(messages)}")
         # 进行压缩
         compressed_messages = self._compress_messages(messages)
 
@@ -185,6 +185,43 @@ class ContextManager:
         # 使用异步方式并行处理
         return asyncio.run(self._async_semantic_summarize(messages))
     
+    def _group_dialogue_blocks(self, messages: list[BaseMessage], max_block_tokens: int = 1500):
+        """
+        将消息按 token 数分块（保证 Human/AI 成对且语义连贯）
+        """
+        processed_messages = []
+        blocks = []
+        current_block = []
+        current_tokens = 0
+        last_type = None
+        for msg in messages:
+            # 非 Human/AI 消息 不应该压缩，
+            if not isinstance(msg, (HumanMessage, AIMessage)):
+                processed_messages.append(msg)
+                continue
+            # 如果当前块 token 超出限制，先结束当前块
+            msg_tokens = self._count_one_message(msg)
+            if current_tokens + msg_tokens > max_block_tokens and current_block:
+                blocks.append(current_block)
+                current_block = []
+                current_tokens = 0
+
+            # 连续同 type 消息拼接
+            if last_type == msg.type and len(current_block) > 0:
+                # 当前块先结束
+                blocks.append(current_block)
+                current_block = []
+                current_tokens = 0
+
+            current_block.append(msg)
+            current_tokens += msg_tokens
+            last_type = msg.type
+            
+        if current_block:
+            blocks.append(current_block)
+
+        return processed_messages,  blocks
+
     async def _async_semantic_summarize(self, messages: list[BaseMessage]) -> list[BaseMessage]:
         """
         异步语义压缩上下文
@@ -192,81 +229,108 @@ class ContextManager:
         # 1. 过滤掉ToolMessage
         filtered_messages = [msg for msg in messages if not isinstance(msg, ToolMessage)]
         
-        # 2. 按块处理Human/AI消息（2个对话/四个message为一块）
-        processed_messages = []
+        # 2.使用按token 数的分块策略
+        processed_messages, blocks = self._group_dialogue_blocks(filtered_messages)
+        
+        # 3. 异步压缩每个块
         block_tasks = []  # 存储异步任务
-        i = 0
+        for block in blocks:
+            # 创建异步任务但不立即执行
+            block_tasks.append({
+                'block_messages': block,
+                'position': len(processed_messages)  # 记录在结果列表中的位置
+            })
+            # 先添加占位符，稍后替换
+            processed_messages.append(None)
         
-        while i < len(filtered_messages):
-            # 检查当前消息是否为HumanMessage或AIMessage
-            if isinstance(filtered_messages[i], (HumanMessage, AIMessage)):
-                # 获取当前对话块（最多4个消息：2个对话回合）
-                block_messages = []
-                j = i
-                dialogue_count = 0
-                
-                while j < len(filtered_messages) and dialogue_count < 2:
-                    current_msg = filtered_messages[j]
-                    if isinstance(current_msg, (HumanMessage, AIMessage)):
-                        block_messages.append(current_msg)
-                        # 一个对话回合包含一个HumanMessage和一个AIMessage
-                        if isinstance(current_msg, HumanMessage):
-                            dialogue_count += 0.5
-                        elif isinstance(current_msg, AIMessage):
-                            dialogue_count += 0.5
-                    else:
-                        # 非Human/AI消息直接添加到结果中
-                        processed_messages.append(current_msg)
-                    j += 1
-                
-                # 如果收集到了有效的对话块，创建异步压缩任务
-                if len(block_messages) >= 2:  # 至少有一个完整的对话回合
-                    # 创建异步任务但不立即执行
-                    block_tasks.append({
-                        'block_messages': block_messages,
-                        'position': len(processed_messages)  # 记录在结果列表中的位置
-                    })
-                    # 先添加占位符
-                    processed_messages.append(None)
-                else:
-                    # 如果块太小，直接保留原消息
-                    processed_messages.extend(block_messages)
-                
-                i = j  # 移动到下一个块
-            else:
-                # 非Human/AI消息直接保留
-                processed_messages.append(filtered_messages[i])
-                i += 1
+        # 4. 并行执行所有异步任务
+        results = await asyncio.gather(*[
+            self._async_summarize_dialogue_block(task['block_messages'])
+            for task in block_tasks
+        ])
         
-        # 并行执行所有压缩任务
-        if block_tasks:
-            # 创建异步任务列表
-            tasks = []
-            for task_info in block_tasks:
-                task = asyncio.create_task(
-                    self._async_summarize_dialogue_block(task_info['block_messages'])
-                )
-                tasks.append((task_info['position'], task))
-            
-            # 等待所有任务完成
-            for position, task in tasks:
-                try:
-                    summary_message = await task
-                    processed_messages[position] = summary_message
-                except Exception as e:
-                    logger.error(f"异步语义压缩失败：{e}")
-                    # 如果压缩失败，使用第一条消息作为占位符
-                    block_messages = next((t['block_messages'] for t in block_tasks if t['position'] == position), [])
-                    if block_messages:
-                        processed_messages[position] = AIMessage(
-                            content=f"[压缩失败] {block_messages[0].content[:100]}..."
-                        )
+        # 5. 根据任务位置替换占位符
+        for task, compressed_block in zip(block_tasks, results):
+            # compressed_block是单个AIMessage对象，直接替换占位符
+            processed_messages[task['position']] = compressed_block
         
-        # 过滤掉None值（理论上不应该有，但为了安全）
-        processed_messages = [msg for msg in processed_messages if msg is not None]
-        
-        logger.info(f"语义压缩完成：原始消息数 {len(messages)} -> 压缩后消息数 {len(processed_messages)}")
         return processed_messages
+        
+        # # 2. 按块处理Human/AI消息（2个对话/四个message为一块）
+        # processed_messages = []
+        # block_tasks = []  # 存储异步任务
+        # i = 0
+        
+        # while i < len(filtered_messages):
+        #     # 检查当前消息是否为HumanMessage或AIMessage
+        #     if isinstance(filtered_messages[i], (HumanMessage, AIMessage)):
+        #         # 获取当前对话块（最多4个消息：2个对话回合）
+        #         block_messages = []
+        #         j = i
+        #         dialogue_count = 0
+                
+        #         while j < len(filtered_messages) and dialogue_count < 2:
+        #             current_msg = filtered_messages[j]
+        #             if isinstance(current_msg, (HumanMessage, AIMessage)):
+        #                 block_messages.append(current_msg)
+        #                 # 一个对话回合包含一个HumanMessage和一个AIMessage
+        #                 if isinstance(current_msg, HumanMessage):
+        #                     dialogue_count += 0.5
+        #                 elif isinstance(current_msg, AIMessage):
+        #                     dialogue_count += 0.5
+        #             else:
+        #                 # 非Human/AI消息直接添加到结果中
+        #                 processed_messages.append(current_msg)
+        #             j += 1
+                
+        #         # 如果收集到了有效的对话块，创建异步压缩任务
+        #         if len(block_messages) >= 2:  # 至少有一个完整的对话回合
+        #             # 创建异步任务但不立即执行
+        #             block_tasks.append({
+        #                 'block_messages': block_messages,
+        #                 'position': len(processed_messages)  # 记录在结果列表中的位置
+        #             })
+        #             # 先添加占位符
+        #             processed_messages.append(None)
+        #         else:
+        #             # 如果块太小，直接保留原消息
+        #             processed_messages.extend(block_messages)
+                
+        #         i = j  # 移动到下一个块
+        #     else:
+        #         # 非Human/AI消息直接保留
+        #         processed_messages.append(filtered_messages[i])
+        #         i += 1
+        
+        # # 并行执行所有压缩任务
+        # if block_tasks:
+        #     # 创建异步任务列表
+        #     tasks = []
+        #     for task_info in block_tasks:
+        #         task = asyncio.create_task(
+        #             self._async_summarize_dialogue_block(task_info['block_messages'])
+        #         )
+        #         tasks.append((task_info['position'], task))
+            
+        #     # 等待所有任务完成
+        #     for position, task in tasks:
+        #         try:
+        #             summary_message = await task
+        #             processed_messages[position] = summary_message
+        #         except Exception as e:
+        #             logger.error(f"异步语义压缩失败：{e}")
+        #             # 如果压缩失败，使用第一条消息作为占位符
+        #             block_messages = next((t['block_messages'] for t in block_tasks if t['position'] == position), [])
+        #             if block_messages:
+        #                 processed_messages[position] = AIMessage(
+        #                     content=f"[压缩失败] {block_messages[0].content[:100]}..."
+        #                 )
+        
+        # # 过滤掉None值（理论上不应该有，但为了安全）
+        # processed_messages = [msg for msg in processed_messages if msg is not None]
+        
+        # logger.info(f"语义压缩完成：原始消息数 {len(messages)} -> 压缩后消息数 {len(processed_messages)}")
+        # return processed_messages
     
     async def _async_summarize_dialogue_block(self, block_messages: list[BaseMessage]) -> BaseMessage:
         """
@@ -275,16 +339,16 @@ class ContextManager:
         # 构建对话文本
         dialogue_text = ""
         for msg in block_messages:
-            role = "用户" if isinstance(msg, HumanMessage) else "助手"
+            role = "user" if isinstance(msg, HumanMessage) else "assistant"
             dialogue_text += f"{role}: {msg.content}\n"
         
         # 使用LLM进行语义压缩
         prompt = f"""
-        请对以下对话进行压缩总结，保留核心信息和对话要点，同时保持语义连贯性。
+        请对以下内容进行压缩总结，保留核心信息和对话要点，同时保持语义连贯性。
         对话内容：
         {dialogue_text}
         
-        请用简洁的语言总结这段对话的主要内容。
+        请用简洁的语言总结这段文本的主要内容。
         """
         
         try:

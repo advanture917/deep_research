@@ -3,16 +3,18 @@ from src.tools.search_with_image import TavilySearchWithImages
 from src.llms.llm import get_llm
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import MessagesState,StateGraph , START , END
-from typing import  List, Optional, Union
+from typing import  List, Optional, Union, Tuple
 from typing_extensions import Annotated
 import operator
-from langchain_core.messages import HumanMessage
+import re
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain.tools import tool
 from datetime import datetime
 from src.prompts.template import render_prompt_template
 from src.graph.type import Plan
 import json
 import logging
+import asyncio
 from langgraph.prebuilt import create_react_agent
 from src.utils.content import ContextManager
 logger = logging.getLogger(__name__)
@@ -93,9 +95,6 @@ def coordinate_node(state: State) -> Command:
     # 检查工具调用
     tool_calls = []
     n = len(result.tool_calls)
-    print(result)
-    print(result.tool_calls)
-    print(n)
 
     if n ==0 :
         print(f"goto: {goto}")
@@ -187,98 +186,225 @@ def human_back_node(state: State) -> Command:
     return Command(
         goto = goto,
     )
-
-def research_node(state: State) -> Command:
+def critic_node(state: State) -> Command:
     """
-    分段式研究节点：
-    每个步骤完成后动态生成报告段落，
-    使用 ContextManager 压缩上下文。
+    批判节点：
+    对研究结果进行批判，判断是否符合预期。
+    """
+    pass
+# langgraph 回溯机制：
+# 1. 当批判节点判断研究结果不符合预期时，
+#    会触发回溯机制，将当前研究节点的状态回滚到上一个状态。
+# 2. 回溯机制会根据当前状态中的 messages 列表，
+#    找到最近的一次研究节点的状态，
+#    并将其作为当前状态。
+
+
+def _extract_links_and_images_from_md(md: str) -> Tuple[List[str], List[str]]:
+    """
+    从 Markdown 中提取链接和图片 URL（去重，按出现顺序）。
+    - 链接格式 [text](http...)
+    - 图片格式 ![alt](http...)
+    - 也尝试匹配裸 URL
+    """
+    if not md:
+        return [], []
+    links = []
+    images = []
+    # 图片优先（它也是链接形式）
+    for m in re.finditer(r'!\[[^\]]*\]\((https?://[^\s)]+)\)', md):
+        url = m.group(1).strip()
+        if url not in images:
+            images.append(url)
+        if url not in links:
+            links.append(url)
+    # 普通链接
+    for m in re.finditer(r'\[[^\]]*\]\((https?://[^\s)]+)\)', md):
+        url = m.group(1).strip()
+        if url not in links:
+            links.append(url)
+    # 裸 url（避免重复）
+    for m in re.finditer(r'(https?://[^\s\)\]]+)', md):
+        url = m.group(1).strip().rstrip(').,')
+        if url not in links:
+            links.append(url)
+    return links, images
+
+
+async def _async_add_summary_and_references(report_md: str) -> str:
+    """
+    异步版本：为研究报告添加总结和引用。
+    """
+    # 使用llm 总结
+    prompt = render_prompt_template("summary")
+    
+    # 异步调用llm 总结报告
+    sys_msg = SystemMessage(content=prompt)
+    human_msg = HumanMessage(content=report_md)
+    summary_result = await llm.ainvoke([sys_msg, human_msg])
+    summary_md = summary_result.content
+    
+    # 提取报告中的链接和图片
+    links, images = _extract_links_and_images_from_md(report_md)
+    # 生成引用列表
+    references = []
+    for i, url in enumerate(links + images):
+        references.append(f"[{i+1}] {url}")
+    # 合并引用
+    references_md = "## 引用列表:\n\n".join(references)
+
+    # 合并到报告
+    report_md = report_md + "\n\n" + summary_md + "\n\n" + references_md
+    return report_md
+
+
+async def research_node(state: State) -> Command:
+    """
+    异步并行版本：
+    - research_agent 与 report_agent 并行
+    - report-agent 串行依赖：必须等待前一步的report结果
+    step1.research  ──────┐
+                      │  (生成结果传入report队列)
+                      ▼
+             step1.report ──────┐
+                                ▼
+step2.research  ──────┐        合并report
+                      │
+                      ▼
+             step2.report ──────┐
+                                ▼
+                          最终汇总
+
     """
     tools = [TavilySearchWithImages()]
-    messages = state.get("messages", [])
-    all_research_messages = []
+    messages = state.get("messages", []) or []
+    research_context_manager = ContextManager(llm, max_tokens=32768)
+    report_context_manager = ContextManager(llm, max_tokens=163840)
+
+    existing_report = state.get("research_summary", "")
+    if not existing_report:
+        existing_report = f"# 研究报告: {state['current_plan'].title}\n\n" \
+                          f"## 背景与研究动机\n{state['current_plan'].thought}\n\n"
+    report_md = existing_report
+
+    RESEARCH_AGENT_SYSTEM = render_prompt_template("research")
+    REPORT_AGENT_SYSTEM = render_prompt_template("report")
+
     step_results = []
-    research_summary_parts = []
+    all_research_messages = []
 
-    context_manager = ContextManager(llm, max_tokens=32768)
-    messages = context_manager.compress(messages)
+    # 队列与同步锁
+    report_queue = asyncio.Queue()
+    report_lock = asyncio.Lock()  # 确保report串行执行
 
-    for i, step in enumerate(state["current_plan"].steps[:2]):
-        logger.info(f"执行研究步骤 {i+1}: {step.title}")
-
-        # 构建步骤提示
-        step_prompt = f"""
-        当前研究步骤 {i+1}: {step.title}
-        描述: {step.description}
-
-        请根据前面的研究发现（如有）继续分析。
-        输出：逻辑清晰、专业化的研究结论。
-        """
-
-        # 构建消息上下文
-        current_messages = messages + [{"role": "user", "content": step_prompt}]
-        agent = create_react_agent(model=llm, tools=tools)
-
+    async def research_worker(step_index, step):
+        """执行单个research step并推入report_queue"""
+        nonlocal messages
         try:
-            # 调用 LLM agent
-            result = agent.invoke({"messages": current_messages})
-            ai_message = result["messages"][-1]
-            raw_result = ai_message.content
+            logger.info(f"[research] 执行步骤 {step_index}: {step.title}")
+            step_user_prompt = f"""
+当前研究步骤 {step_index}: {step.title}
+描述: {step.description}
 
-            # 保存原始结果
-            step_results.append({
-                "step_index": i,
+要求：
+- 输出为 Markdown（包含标题、分析、结论）。
+- 正文中使用 Markdown 链接格式 `[描述文字](URL)` 标注引用。
+- **保持 Markdown 格式**: 图片使用标准 Markdown 语法 `![描述文字](图片URL)`。
+"""
+            current_messages = messages + [
+                SystemMessage(content=RESEARCH_AGENT_SYSTEM),
+                HumanMessage(content=step_user_prompt)
+            ]
+            current_messages = research_context_manager.compress_messages(current_messages)
+
+            research_agent = create_react_agent(model=llm, tools=tools)
+            result = await research_agent.ainvoke({"messages": current_messages})
+            step_md = result["messages"][-1].content if isinstance(result["messages"][-1], AIMessage) else str(result["messages"][-1])
+
+            links, images = _extract_links_and_images_from_md(step_md)
+
+            await report_queue.put({
+                "step_index": step_index,
                 "title": step.title,
                 "description": step.description,
-                "result": raw_result,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "step_md": step_md,
+                "sources": links,
+                "images": images
             })
 
-            # 让 ContextManager 生成该步骤的"报告段落"
-            from langchain_core.messages import SystemMessage, HumanMessage
-            section_prompt = [
-                SystemMessage(content="你是科研报告撰写专家。"),
-                HumanMessage(content=f"请将以下研究结果转化为结构化报告段落，风格正式且逻辑连贯：\n\n{raw_result}")
-            ]
-            section = llm.invoke(section_prompt).content
-            research_summary_parts.append(section)
-
-            # 压缩上下文
-            messages = context_manager.compress(
-                messages + [
-                    {"role": "user", "content": step_prompt},
-                    {"role": "assistant", "content": raw_result}
-                ]
-            )
-
-            all_research_messages.append(raw_result)
-            logger.info(f"步骤 {i+1} 完成")
+            logger.info(f"[research] 步骤 {step_index} 完成，已推入report队列")
 
         except Exception as e:
-            logger.exception(f"执行步骤 {i+1} 出错: {e}")
+            logger.exception(f"[research] 步骤 {step_index} 出错: {e}")
             step_results.append({
-                "step_index": i,
+                "step_index": step_index,
                 "title": step.title,
                 "description": step.description,
-                "result": f"研究失败: {str(e)}",
+                "result_markdown": f"研究失败: {str(e)}",
+                "sources": [],
+                "images": [],
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "error": True
             })
 
-    # 拼接报告
-    research_summary = f"# 研究报告: {state['current_plan'].title}\n\n"
-    research_summary += f"## 背景与研究动机\n{state['current_plan'].thought}\n\n"
+    async def report_worker():
+        """按队列顺序串行整合报告"""
+        nonlocal report_md
+        while True:
+            item = await report_queue.get()
+            if item is None:
+                break  # 结束信号
+            async with report_lock:
+                step_index = item["step_index"]
+                step_md = item["step_md"]
+                logger.info(f"[report] 合并步骤 {step_index}")
 
-    for idx, section in enumerate(research_summary_parts, start=1):
-        research_summary += f"## {section}\n\n"
+                report_user_prompt = f"""
+previous_report: '''{report_md}'''
+latest_step: '''{step_md}'''
 
-    research_summary += f"---\n研究完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+请输出增量内容：仅包含最新 step 的 Markdown。
+"""
+                report_messages = messages + [
+                    SystemMessage(content=REPORT_AGENT_SYSTEM),
+                    HumanMessage(content=report_user_prompt)
+                ]
+                report_messages = report_context_manager.compress_messages(report_messages)
+
+                report_result = await llm.ainvoke(report_messages)
+                increment_md = report_result.content
+
+                report_md += "\n\n" + increment_md
+                step_results.append({
+                    **item,
+                    "result_markdown": step_md,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": False
+                })
+                logger.info(f"[report] 步骤 {step_index} 已合并完成")
+
+    # 创建任务
+    research_tasks = [
+        asyncio.create_task(research_worker(i + 1, step))
+        for i, step in enumerate(state["current_plan"].steps[:2])
+    ]
+    report_task = asyncio.create_task(report_worker())
+
+    # 等待research完成
+    await asyncio.gather(*research_tasks)
+    # 发出结束信号
+    await report_queue.put(None)
+    # 等待report完成
+    await report_task
+
+    summary = await _async_add_summary_and_references(report_md)
+    final_report = summary + f"\n\n---\n研究完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
 
     return Command(
         update={
             "messages": messages,
             "observations": state.get("observations", []) + all_research_messages,
-            "research_summary": research_summary,
+            "research_summary": final_report,
             "step_results": step_results,
             "research_loop_count": state.get("research_loop_count", 0) + 1,
         },
@@ -309,7 +435,7 @@ graph = graph_build.compile(checkpointer=checkpointer)
 
 # 通过 langgraph dev 启动 ，langgraph API 会自动处理持久化，不需要自定义检查点
 # graph = graph_build.compile()
-def test_research_flow(research_topic: str = "2025 年 token2049大会的内容和愿景", locale: str = "zh-CN"):
+async def test_research_flow(research_topic: str = "2025 年 token2049大会的内容和愿景", locale: str = "zh-CN"):
     """
     测试完整的研究流程
     
@@ -350,11 +476,11 @@ def test_research_flow(research_topic: str = "2025 年 token2049大会的内容�
     try:
         # 阶段1: 协调器
         print("\n📋 阶段1: 协调器分析...")
-        for result in graph.stream(test_state, config):
+        async for result in graph.astream(test_state, config):
             stage_name = list(result.keys())[0]
             results["stages"].append(stage_name)
             print(f"✅ {stage_name}")   
-        for chunk in graph.stream(Command(resume={
+        async for chunk in graph.astream(Command(resume={
                     "user_confirm": "confirm",
                     # "message": 
                 }), config):
@@ -369,6 +495,7 @@ def test_research_flow(research_topic: str = "2025 年 token2049大会的内容�
 
 # 测试运行
 if __name__ == "__main__":
-
-    result = test_research_flow()
+    import asyncio
+    
+    result = asyncio.run(test_research_flow())
     
