@@ -18,21 +18,11 @@ const ReportPage: React.FC = () => {
     const generateReport = async () => {
       try {
         if (state.status === 'completed' && state.researchSummary) {
-          // 使用后端返回的研究摘要和步骤结果生成报告
+          // 直接使用后端返回的researchSummary内容
           const reportData = {
             id: state.planId,
             title: `关于"${state.researchTopic}"的研究报告`,
-            content: `# 关于"${state.researchTopic}"的研究报告
-
-## 研究概述
-
-${state.stepResults?.map((step: any, index: number) => `### ${index + 1}. ${step.title || `步骤${index + 1}`}
-${step.content || step.result || '暂无详细内容'}
-`).join('\n') || '暂无详细研究过程信息。'}
-
-## 结论
-本研究基于系统性的调研和分析，提供了对"${state.researchTopic}"的深入理解。`,
-            steps: state.stepResults || [],
+            content: state.researchSummary, // 直接使用后端生成的Markdown内容
             status: state.status,
             created_at: new Date().toISOString(),
           };
@@ -193,19 +183,12 @@ ${step.content || step.result || '暂无详细内容'}
         </div>
 
         {/* Report Metadata */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center space-x-3 p-4 bg-gray-50 rounded-xl">
             <Calendar className="h-5 w-5 text-gray-500" />
             <div>
               <p className="text-sm text-gray-600">生成时间</p>
               <p className="font-semibold text-gray-800">{new Date(report.created_at).toLocaleDateString()}</p>
-            </div>
-          </div>
-          <div className="flex items-center space-x-3 p-4 bg-gray-50 rounded-xl">
-            <FileText className="h-5 w-5 text-gray-500" />
-            <div>
-              <p className="text-sm text-gray-600">研究步骤</p>
-              <p className="font-semibold text-gray-800">{report.steps.length} 个</p>
             </div>
           </div>
           <div className="flex items-center space-x-3 p-4 bg-gray-50 rounded-xl">
@@ -251,61 +234,6 @@ ${step.content || step.result || '暂无详细内容'}
               {report.content}
             </ReactMarkdown>
           </div>
-          
-          {/* Research Steps */}
-          {report.steps && report.steps.length > 0 && (
-            <div className="mt-8">
-              <h2 className="text-2xl font-bold text-gray-900 mb-6">详细研究过程</h2>
-              {report.steps.map((step: any, index: number) => (
-                <motion.div
-                  key={index}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: index * 0.1 }}
-                  className="mb-8 p-6 bg-gray-50 rounded-xl border border-gray-200"
-                >
-                  <div className="flex items-center space-x-3 mb-4">
-                    <div className="w-8 h-8 bg-primary-500 text-white rounded-full flex items-center justify-center font-semibold text-sm">
-                      {index + 1}
-                    </div>
-                    <h3 className="text-xl font-semibold text-gray-800">{step.title}</h3>
-                  </div>
-                  
-                  <div className="mb-4">
-                    <p className="text-gray-700 leading-relaxed">{step.content}</p>
-                  </div>
-
-                  {step.sources && step.sources.length > 0 && (
-                    <div>
-                      <h4 className="text-lg font-semibold text-gray-800 mb-3 flex items-center">
-                        <Lightbulb className="h-5 w-5 text-accent-500 mr-2" />
-                        参考资料
-                      </h4>
-                      <div className="space-y-2">
-                        {step.sources.map((source: any, sourceIndex: number) => (
-                          <div key={sourceIndex} className="flex items-start space-x-3 p-3 bg-white rounded-lg border border-gray-100">
-                            <div className="w-2 h-2 bg-primary-500 rounded-full mt-2"></div>
-                            <div className="flex-1">
-                              <h5 className="font-medium text-gray-800">{source.title}</h5>
-                              <p className="text-sm text-gray-600 mt-1">{source.snippet}</p>
-                              <a
-                                href={source.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-sm text-primary-600 hover:text-primary-700 underline"
-                              >
-                                查看详情 →
-                              </a>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </motion.div>
-              ))}
-            </div>
-          )}
 
           <div className="text-center text-sm text-gray-500 border-t border-gray-200 pt-6 mt-8">
             <p>本报告由AI深度研究系统生成，仅供参考</p>

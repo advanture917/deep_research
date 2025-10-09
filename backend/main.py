@@ -199,7 +199,7 @@ async def confirm_plan(request: ConfirmPlan):
             raise HTTPException(status_code=400, detail="无效的用户确认类型")
         
         # 继续执行graph流程
-        for result in graph.stream(cmd, config):
+        async for result in graph.astream(cmd, config):
             stage_name = list(result.keys())[0]
             logger.info(f"继续执行阶段: {stage_name}")
             

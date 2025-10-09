@@ -181,22 +181,11 @@ const HomePage: React.FC = () => {
 
   // 生成研究报告
   const generateReport = () => {
-    if (state.status === 'completed' && state.researchSummary && state.stepResults) {
-      const reportContent = `# 关于"${state.researchTopic}"的研究报告
-
-## 研究概述
-
-${state.stepResults?.map((step: any, index: number) => `### ${index + 1}. ${step.title || `步骤${index + 1}`}
-${step.content || step.result || '暂无详细内容'}
-`).join('\n') || '暂无详细研究过程信息。'}
-
-## 结论
-本研究基于系统性的调研和分析，提供了对"${state.researchTopic}"的深入理解。`;
-
+    if (state.status === 'completed' && state.researchSummary) {
+      // 直接使用后端返回的researchSummary内容
       return {
         title: `关于"${state.researchTopic}"的研究报告`,
-        content: reportContent,
-        steps: state.stepResults || [],
+        content: state.researchSummary, // 直接使用后端生成的Markdown内容
         created_at: new Date().toISOString(),
       };
     }

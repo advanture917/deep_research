@@ -258,7 +258,7 @@ async def _async_add_summary_and_references(report_md: str) -> str:
     return report_md
 
 
-async def research_node(state: State) -> Command:
+async def async_research_node(state: State) -> Command:
     """
     异步并行版本：
     - research_agent 与 report_agent 并行
@@ -267,7 +267,7 @@ async def research_node(state: State) -> Command:
                       │  (生成结果传入report队列)
                       ▼
              step1.report ──────┐
-                                ▼
+                      |          ▼
 step2.research  ──────┐        合并report
                       │
                       ▼
@@ -410,8 +410,7 @@ latest_step: '''{step_md}'''
         },
         goto="__end__"
     )
-
-        
+      
 # 构建完整的研究流程图
 graph_build = StateGraph(State)
 
@@ -419,7 +418,7 @@ graph_build = StateGraph(State)
 graph_build.add_node("coordinate", coordinate_node)
 graph_build.add_node("generate_plan", generate_plan)
 graph_build.add_node("human_feedback", human_back_node)
-graph_build.add_node("research_node", research_node)
+graph_build.add_node("research_node", async_research_node)
 
 # 定义流程
 graph_build.add_edge(START, "coordinate")

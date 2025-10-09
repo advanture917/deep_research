@@ -110,6 +110,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Exception: frontend/.env should be tracked
+!frontend/.env
+
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -325,7 +328,6 @@ dist
 
 # Gatsby files
 .cache/
-public
 
 # Storybook build outputs
 .out
