@@ -251,7 +251,8 @@ async def _async_add_summary_and_references(report_md: str) -> str:
     for i, url in enumerate(links + images):
         references.append(f"[{i+1}] {url}")
     # 合并引用
-    references_md = "## 引用列表:\n\n".join(references)
+    references_md = "## 引用列表:\n\n" + "\n".join(references)
+
 
     # 合并到报告
     report_md = report_md + "\n\n" + summary_md + "\n\n" + references_md
@@ -373,7 +374,12 @@ latest_step: '''{step_md}'''
 
                 report_result = await llm.ainvoke(report_messages)
                 increment_md = report_result.content
-
+                print(f"[report] 步骤 {step_index} 增量内容: {increment_md}")
+                # 检查 increment_md 是否包含 existing_report 的标题+背景
+                existing_header = f"# 研究报告: {state['current_plan'].title}\n\n" \
+                                f"## 背景与研究动机\n{state['current_plan'].thought}\n\n"
+                if increment_md.startswith(existing_header):
+                    report_md = ""  # 清空已有 report_md，避免重复
                 report_md += "\n\n" + increment_md
                 step_results.append({
                     **item,
@@ -432,7 +438,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 checkpointer = InMemorySaver() 
 graph = graph_build.compile(checkpointer=checkpointer)
 
-# 通过 langgraph dev 启动 ，langgraph API 会自动处理持久化，不需要自定义检查点
+# 通过 langgraph dev 启动 ，langgraph API 会自动处理持久化，不需要自定义检查点，否则报错
 # graph = graph_build.compile()
 async def test_research_flow(research_topic: str = "2025 年 token2049大会的内容和愿景", locale: str = "zh-CN"):
     """
