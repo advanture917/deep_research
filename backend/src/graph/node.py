@@ -65,69 +65,124 @@ def coordinate_node(state: State) -> Command:
     轻问题 → 直接回答
     重问题 → 交给 planner
     """
-    # 获取用户输入的研究主题
-    research_topic = state.get("research_topic", "")
-    locale = state.get("locale", "zh-CN")
+    chunks = []
+    for chunk in llm.stream(state["messages"]):
+        delta = getattr(chunk, "content", None)
+        if delta:
+            # print(delta, end="", flush=True)
+            chunks.append(delta)
+    full_text = "".join(chunks)
+    state["messages"].append(AIMessage(content=full_text))
+    state["messages"].append(HumanMessage(content="详细辩论上面你的回答"))
+    # print(f"{state} A")
+    # state["term"] += 1
+    return Command(
+        update={
+            "messages": [AIMessage(content=full_text)]
+        },
+        goto="__end__"
+    )
+    # # 获取用户输入的研究主题
+    # research_topic = state.get("research_topic", "")
+    # locale = state.get("locale", "zh-CN")
     
-    # 如果没有研究主题，使用用户最后一条消息作为输入
-    if not research_topic:
-        # 从消息历史中获取最后一条用户消息
-        messages = state["messages"][-1]
-        research_topic = messages.content
+    # # 如果没有研究主题，使用用户最后一条消息作为输入
+    # if not research_topic:
+    #     # 从消息历史中获取最后一条用户消息
+    #     messages = state["messages"][-1]
+    #     research_topic = messages.content
 
-    # 准备协调器提示模板
-    template_vars = {
-        "CURRENT_TIME": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        # "research_topic": research_topic,
-    }
-    # 使用协调器提示模板
-    system_prompt = render_prompt_template("coordinate", **template_vars)
-    llm_with_tools = llm.bind_tools([handoff_to_planner])
+    # # 准备协调器提示模板
+    # template_vars = {
+    #     "CURRENT_TIME": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    #     # "research_topic": research_topic,
+    # }
+    # # 使用协调器提示模板
+    # system_prompt = render_prompt_template("coordinate", **template_vars)
+    # llm_with_tools = llm.bind_tools([handoff_to_planner])
     
-    # 运行协调器代理
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": research_topic}
-    ]
-    
-    result = llm_with_tools.invoke(messages)
-    goto = "__end__"
-    # 检查工具调用
-    tool_calls = []
-    n = len(result.tool_calls)
+    # # 运行协调器代理
+    # system_messages = [SystemMessage(content=system_prompt)]
+    # human_messages = [HumanMessage(content=research_topic)]
+    # messages = system_messages + human_messages
 
-    if n ==0 :
-        print(f"goto: {goto}")
-    # 直接回答简单问题，返回最后一条消息
-        return Command(
-            update={
-                "messages": [{"role": "assistant", "content": result.content}]
-            },
-            goto= goto,
-        )
+    # # 流式累积内容与工具调用
+    # content_chunks = []
+    # tool_calls = []
+    # final_chunk = None
+    # for chunk in llm_with_tools.stream(messages):
+    #     # 累积文本
+    #     delta = getattr(chunk, "content", None)
+    #     if delta:
+    #         content_chunks.append(delta)
+    #     # 累积工具调用（兼容不同实现的增量）
+    #     if hasattr(chunk, "tool_calls") and chunk.tool_calls:
+    #         try:
+    #             # 可能是列表增量，直接并入
+    #             tool_calls.extend(chunk.tool_calls)
+    #         except Exception:
+    #             pass
+    #     final_chunk = chunk
 
-    tool_calls.extend(result.tool_calls)
-    goto = "generate_plan"    
-    # 检查是否调用了handoff_to_planner工具
-    handoff_calls = [call for call in tool_calls if call["name"] == "handoff_to_planner"]
-    print(f"handoff_calls: {handoff_calls}")
-    if handoff_calls:
-        # 提取工具调用的参数并填充到state中
-        tool_call = handoff_calls[-1]  # 使用最后一次调用的参数
-        args = tool_call["args"] if "args" in tool_call else {}
+    # # 若增量未携带工具，尝试从最终块读取
+    # if not tool_calls and final_chunk is not None and hasattr(final_chunk, "tool_calls"):
+    #     try:
+    #         tool_calls = list(getattr(final_chunk, "tool_calls", []) or [])
+    #     except Exception:
+    #         tool_calls = []
 
-        research_topic = args.get("research_topic", research_topic)
-        locale = args.get("locale", locale)
+    # full_content = "".join(content_chunks)
+    # goto = "__end__"
+
+    # # 无工具调用：直接回答简单问题
+    # if not tool_calls:
+    #     print(f"goto: {goto}")
+    #     ai_message = AIMessage(content=full_content)
+    #     return Command(
+    #         update={
+    #             "messages": [ai_message]
+    #         },
+    #         goto= goto,
+    #     )
+
+    # # 有工具调用：进入生成计划
+    # goto = "generate_plan"    
+    # # 检查是否调用了handoff_to_planner工具
+    # # 兼容不同结构（对象/字典）
+    # def _normalize_call(call):
+    #     if isinstance(call, dict):
+    #         return call
+    #     name = getattr(call, "name", None)
+    #     args = getattr(call, "args", None) or getattr(call, "arguments", None)
+    #     try:
+    #         if hasattr(args, "model_dump"):
+    #             args = args.model_dump()
+    #         elif hasattr(args, "dict"):
+    #             args = args.dict()
+    #     except Exception:
+    #         pass
+    #     return {"name": name, "args": args}
+
+    # norm_calls = [_normalize_call(c) for c in tool_calls]
+    # handoff_calls = [call for call in norm_calls if call.get("name") == "handoff_to_planner"]
+    # print(f"handoff_calls: {handoff_calls}")
+    # if handoff_calls:
+    #     # 提取工具调用的参数并填充到state中
+    #     tool_call = handoff_calls[-1]  # 使用最后一次调用的参数
+    #     args = tool_call.get("args", {}) or {}
+
+    #     research_topic = args.get("research_topic", research_topic)
+    #     locale = args.get("locale", locale)
         
-        # 需要进入研究计划阶段，返回更新后的状态
-        return Command(
-            update={
-                "research_topic": research_topic,
-                "locale": locale,
-            },
-            goto= goto,
+    #     # 需要进入研究计划阶段，返回更新后的状态
+    #     return Command(
+    #         update={
+    #             "research_topic": research_topic,
+    #             "locale": locale,
+    #         },
+    #         goto= goto,
             
-        )
+    #     )
     
 
 
@@ -156,11 +211,12 @@ def generate_plan(state: State) -> dict:
     struct_llm = llm.with_structured_output(Plan)
     response = struct_llm.invoke(messages)
     response_str = response.model_dump_json(indent=4)
+    ai_message = AIMessage(content=response_str)
     # 返回字典用于更新状态
     return {
         "current_plan": response,
         "plan_iterations": state.get("plan_iterations", 0) + 1,
-        "messages": [{"role": "assistant", "content": response_str}]
+        "messages": [ai_message]
     }
 
 def human_back_node(state: State) -> Command:
@@ -241,8 +297,13 @@ async def _async_add_summary_and_references(report_md: str) -> str:
     # 异步调用llm 总结报告
     sys_msg = SystemMessage(content=prompt)
     human_msg = HumanMessage(content=report_md)
-    summary_result = await llm.ainvoke([sys_msg, human_msg])
-    summary_md = summary_result.content
+    # 流式累积总结内容
+    content_chunks = []
+    async for chunk in llm.astream([sys_msg, human_msg]):
+        delta = getattr(chunk, "content", None)
+        if delta:
+            content_chunks.append(delta)
+    summary_md = "".join(content_chunks)
     
     # 提取报告中的链接和图片
     links, images = _extract_links_and_images_from_md(report_md)
@@ -372,8 +433,13 @@ latest_step: '''{step_md}'''
                 ]
                 report_messages = report_context_manager.compress_messages(report_messages)
 
-                report_result = await llm.ainvoke(report_messages)
-                increment_md = report_result.content
+                # 流式生成增量内容
+                inc_chunks = []
+                async for rchunk in llm.astream(report_messages):
+                    delta = getattr(rchunk, "content", None)
+                    if delta:
+                        inc_chunks.append(delta)
+                increment_md = "".join(inc_chunks)
                 print(f"[report] 步骤 {step_index} 增量内容: {increment_md}")
                 # 检查 increment_md 是否包含 existing_report 的标题+背景
                 existing_header = f"# 研究报告: {state['current_plan'].title}\n\n" \
@@ -440,7 +506,7 @@ graph = graph_build.compile(checkpointer=checkpointer)
 
 # 通过 langgraph dev 启动 ，langgraph API 会自动处理持久化，不需要自定义检查点，否则报错
 # graph = graph_build.compile()
-async def test_research_flow(research_topic: str = "2025 年 token2049大会的内容和愿景", locale: str = "zh-CN"):
+async def test_research_flow(research_topic: str = "你是谁", locale: str = "zh-CN"):
     """
     测试完整的研究流程
     
@@ -481,15 +547,24 @@ async def test_research_flow(research_topic: str = "2025 年 token2049大会的�
     try:
         # 阶段1: 协调器
         print("\n📋 阶段1: 协调器分析...")
-        async for result in graph.astream(test_state, config):
-            stage_name = list(result.keys())[0]
+        async for result in graph.astream(test_state, config, stream_mode="messages"):
+            print(result)
+            print(type(result))
+
+            print(result[0].content, end="", flush=True)
+            stage_name = list(result)
+            for i in range(len(result)):
+                print(f"{i}: {result[i]}")
+                print(f"{i}: {type(result[i])}")
+            break
             results["stages"].append(stage_name)
+            print(result)
             print(f"✅ {stage_name}")   
         async for chunk in graph.astream(Command(resume={
                     "user_confirm": "confirm",
                     # "message": 
                 }), config):
-            print(chunk)
+                print(chunk)
     except Exception as e:
         print(f"\n❌ 测试失败: {e}")
         results["error"] = str(e)

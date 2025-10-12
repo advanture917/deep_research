@@ -7,23 +7,21 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { useNavigate } from 'react-router-dom';
 import ChatInterface from '../components/ChatInterface';
-import { useResearchStream } from '../hooks/useResearchStream';
-import { startResearch } from '../services/researchService';
+import { startResearchSSE } from '../services/researchService';
 
 const HomePage: React.FC = () => {
   const { state, dispatch } = useResearch();
   const [isLoading, setIsLoading] = useState(false);
-  const [currentPlanId, setCurrentPlanId] = useState<string | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
   const navigate = useNavigate();
   
-  // 使用研究流Hook
-  const { state: streamState, isLoading: streamLoading, error: streamError, isConnected } = useResearchStream(currentPlanId);
 
   // 处理发送消息 - 使用LangGraph实时流
   const handleSendMessage = async (message: string) => {
-    if (!message.trim()) return;
+    if (!message.trim() || isLoading) return;
 
     setIsLoading(true);
+    setIsConnected(true);
     
     // 添加用户消息
     dispatch({
@@ -36,128 +34,87 @@ const HomePage: React.FC = () => {
       },
     });
 
-    try {
-      // 使用研究服务开始研究流程
-      const result = await startResearch(message, 'zh-CN');
-      
-      // 只有当问题需要研究计划时才启动实时流轮询
-      if (result.need_plan) {
-        setCurrentPlanId(result.plan_id || null);
-      }
-      
-      // 更新研究上下文状态
-      dispatch({
-        type: 'UPDATE_FROM_BACKEND',
-        payload: {
-          researchTopic: message,
-          planId: result.plan_id,
-          status: result.status,
-          currentStage: result.current_stage,
-          needPlan: result.need_plan,
-          researchSummary: result.research_summary,
-          stepResults: result.step_results || [],
-        },
-      });
+    // 初始化上下文
+    dispatch({ type: 'UPDATE_FROM_BACKEND', payload: { researchTopic: message } });
 
-      // 添加AI初始回复
-      dispatch({
-        type: 'ADD_MESSAGE',
-        payload: {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: typeof result.messages === 'string' ? result.messages : `好的！我已经开始为您研究关于"${message}"的相关内容。`,
-          timestamp: new Date(),
-        },
-      });
-
-    } catch (error) {
-      console.error('开始研究失败:', error);
-      
-      // 添加错误消息
-      dispatch({
-        type: 'ADD_MESSAGE',
-        payload: {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: '抱歉，处理您的请求时出现了问题。请稍后重试。',
-          timestamp: new Date(),
-        },
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 监听实时流状态变化
-  useEffect(() => {
-    if (streamState) {
-      // 添加调试日志
-      console.log('🔄 实时流状态更新:', {
-        status: streamState.status,
-        need_plan: streamState.need_plan,
-        current_stage: streamState.current_stage,
-        has_plan: !!streamState.current_plan,
-        messages: streamState.messages
-      });
-
-      // 如果后端返回了消息内容，添加到消息列表
-      if (streamState.messages && typeof streamState.messages === 'string') {
+    let assistantMsgId: string | null = null;
+    let accumulated = '';
+    const controller = startResearchSSE(message, 'zh-CN', {
+      onStarted: (data) => {
+        if (data?.plan_id) {
+          dispatch({ type: 'SET_PLAN_ID', payload: data.plan_id });
+        }
+      },
+      onChunk: (data) => {
+        const delta: string = data?.delta || '';
+        if (!delta) return;
+        accumulated += delta;
+        if (!assistantMsgId) {
+          assistantMsgId = (Date.now() + 1).toString();
+          dispatch({
+            type: 'ADD_MESSAGE',
+            payload: { id: assistantMsgId, role: 'assistant', content: delta, timestamp: new Date() },
+          });
+        } else {
+          // 仅更新该条助手消息内容，避免替换整个消息数组
+          dispatch({ type: 'UPDATE_MESSAGE_CONTENT', payload: { id: assistantMsgId, content: accumulated } });
+        }
+      },
+      onCoordinate: (data) => {
+        // 仅当 simple=true 时才判定完成
+        const content = data?.message || '';
+        if (!assistantMsgId) {
+          dispatch({
+            type: 'ADD_MESSAGE',
+            payload: { id: (Date.now() + 2).toString(), role: 'assistant', content, timestamp: new Date() },
+          });
+        }
+        if (data?.simple) {
+          dispatch({ type: 'UPDATE_FROM_BACKEND', payload: { status: 'completed', currentStage: 'coordinate' } });
+          navigate('/report');
+        }
+      },
+      onPlan: (data) => {
+        dispatch({
+          type: 'UPDATE_FROM_BACKEND',
+          payload: { needPlan: true, status: 'plan_generated', currentStage: 'generate_plan', currentPlan: data?.current_plan || null },
+        });
+      },
+      onInterrupt: () => {
+        dispatch({ type: 'UPDATE_FROM_BACKEND', payload: { status: 'awaiting_confirmation', currentStage: 'human_feedback', needPlan: true } });
+        navigate('/plan');
+      },
+      onResearch: (data) => {
+        dispatch({
+          type: 'UPDATE_FROM_BACKEND',
+          payload: { status: 'completed', currentStage: 'research_node', researchSummary: data?.research_summary || null, stepResults: data?.step_results || [] },
+        });
+        navigate('/report');
+      },
+      onDone: () => {
+        setIsLoading(false);
+        setIsConnected(false);
+        // 简单问题：若只收到 chunk 而未收到 plan/interrupt/research/coordinate simple，则在完成时标记完成
+        if (assistantMsgId && accumulated && state.status === 'pending') {
+          dispatch({ type: 'UPDATE_FROM_BACKEND', payload: { status: 'completed', currentStage: 'coordinate' } });
+          navigate('/report');
+        }
+      },
+      onError: (err) => {
+        console.error('SSE错误:', err);
         dispatch({
           type: 'ADD_MESSAGE',
-          payload: {
-            id: Date.now().toString(),
-            role: 'assistant',
-            content: streamState.messages,
-            timestamp: new Date(),
-          },
+          payload: { id: (Date.now() + 2).toString(), role: 'assistant', content: '抱歉，流连接出现问题，请稍后重试。', timestamp: new Date() },
         });
-      }
-      
-      // 更新研究上下文状态
-      dispatch({
-        type: 'UPDATE_FROM_BACKEND',
-        payload: {
-          status: streamState.status,
-          currentStage: streamState.current_stage,
-          needPlan: streamState.need_plan,
-          currentPlan: streamState.current_plan,
-          researchSummary: streamState.research_summary,
-          stepResults: streamState.step_results || [],
-        },
-      });
+        setIsLoading(false);
+        setIsConnected(false);
+      },
+    });
 
-      // 根据状态变化处理导航 - 添加更详细的条件判断
-      const shouldNavigateToPlan = streamState.need_plan && 
-        (streamState.status === 'awaiting_confirmation' || streamState.status === 'plan_generated');
-      
-      console.log('🧭 导航判断:', {
-        shouldNavigateToPlan,
-        condition1: streamState.need_plan,
-        condition2: streamState.status === 'awaiting_confirmation' || streamState.status === 'plan_generated',
-        status: streamState.status
-      });
+    return () => controller.close();
+  };
 
-      if (shouldNavigateToPlan) {
-        console.log('🚀 导航到计划页面');
-        // 需要用户确认计划，导航到计划页面并停止轮询
-        setCurrentPlanId(null); // 停止实时流轮询，让计划页面处理后续交互
-        navigate('/plan');
-      } else if (streamState.status === 'completed') {
-        console.log('🚀 导航到报告页面');
-        // 研究完成，导航到报告页面并停止实时流轮询
-        setCurrentPlanId(null); // 停止实时流轮询
-        navigate('/report');
-      }
-    }
-  }, [streamState, dispatch, navigate]);
-
-  // 监听流错误
-  useEffect(() => {
-    if (streamError) {
-      console.error('研究流错误:', streamError);
-      // 可以在这里添加错误处理逻辑
-    }
-  }, [streamError]);
+  // 移除轮询式流监听，改为 SSE 事件内更新与导航
 
   const sampleQuestions = [
     "2025年token2049大会有哪些重要议题和演讲？",
@@ -177,7 +134,7 @@ const HomePage: React.FC = () => {
     }));
   
   // 组合加载状态
-  const combinedIsLoading = isLoading || streamLoading;
+  const combinedIsLoading = isLoading;
 
   // 生成研究报告
   const generateReport = () => {
@@ -204,14 +161,14 @@ const HomePage: React.FC = () => {
             <span className="text-gray-600">
               LangGraph实时流: {isConnected ? '已连接' : '待连接'}
             </span>
-            {streamState && (
+            {state && (
               <span className="text-gray-500">
-                | 状态: {streamState.status} | 阶段: {streamState.current_stage || '等待中'}
+                | 状态: {state.status} | 阶段: {state.currentStage || '等待中'}
               </span>
             )}
           </div>
-          {currentPlanId && (
-            <span className="text-gray-400 text-xs">计划ID: {currentPlanId}</span>
+          {state.planId && (
+            <span className="text-gray-400 text-xs">计划ID: {state.planId}</span>
           )}
         </div>
       </div>

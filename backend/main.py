@@ -1,10 +1,12 @@
 from ast import Str
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from langgraph.store.base import Op
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import json
+from langchain_core.messages import AIMessageChunk
 import uuid
 from datetime import datetime
 import logging
@@ -51,6 +53,28 @@ class ResearchStatus(BaseModel):
 
 # 存储研究状态
 research_states: Dict[str, Dict] = {}
+
+
+def _json_dumps(data: Any) -> str:
+    def _default(o: Any):
+        if hasattr(o, "model_dump"):
+            return o.model_dump()
+        if hasattr(o, "dict"):
+            return o.dict()
+        return str(o)
+    return json.dumps(data, ensure_ascii=False, default=_default)
+
+
+def _sse_pack(data: Any, event: Optional[str] = None) -> bytes:
+    payload = _json_dumps(data)
+    lines = []
+    if event:
+        lines.append(f"event: {event}")
+    # 避免单行过长，可按行切分（简单实现）
+    for line in payload.splitlines() or [payload]:
+        lines.append(f"data: {line}")
+    lines.append("")  # 事件结束空行
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 @app.get("/")
 async def root():
@@ -164,6 +188,159 @@ async def start_research(request: ResearchRequest):
         logger.error(f"开始研究流程失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/research/start/stream")
+async def start_research_stream(request: ResearchRequest, http_request: Request):
+    """基于SSE的流式启动研究：按阶段推送事件。
+    事件类型：
+    - started: 返回plan_id
+    - coordinate: 简单问题直接返回答案
+    - plan: 生成研究计划（Plan结构）
+    - interrupt: 进入人工确认阶段
+    - research: 研究完成结果（summary、step_results）
+    - done: 结束
+    """
+    try:
+        plan_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": plan_id}}
+        initial_state = State(
+            messages=[HumanMessage(content=request.topic, name="用户输入")],
+            research_topic=request.topic,
+            locale=request.locale
+        )
+
+        research_states[plan_id] = {
+            "config": config,
+            "current_state": initial_state,
+            "status": "coordinate",
+            "created_at": datetime.now().isoformat()
+        }
+
+        # 可选模式：stages（默认，按阶段推送）/ messages（推送LLM增量token）
+        mode = http_request.query_params.get("mode", "stages").lower()
+        mode = "messages"
+        async def event_generator():
+            try:
+                # 开场事件
+                yield _sse_pack({"plan_id": plan_id, "message": "研究流程已启动"}, event="started")
+
+                if mode == "messages":
+                    # 按token增量推送（与 node.py 本地流式测试一致的效果）
+                    # 将列表作为 stream_mode 参数传递，以同时流式处理多种模式。
+                    # 流式输出将是 (模式, 块) 的元组，其中 模式 是流模式的名称，块 是该模式流式传输的数据。
+                    # async for msg_chunk in graph.astream(initial_state, config, stream_mode=["messages","updates"]):
+                    async for msg_chunk in graph.astream(initial_state, config, stream_mode="messages"):
+                        if await http_request.is_disconnected():
+                            logger.info(f"SSE client disconnected: {plan_id}")
+                            break
+                        try:
+                        
+                            # 兼容 node.py 的打印方式：result[0].content
+                            chunk = msg_chunk[0]
+                            # logger.info(f"chunk: {chunk}")
+                            # logger.info(f"type(chunk): {type(chunk)}")
+                            if isinstance(chunk, AIMessageChunk):
+                                delta = getattr(chunk, "content", None)
+                                if delta:
+                                    yield _sse_pack({"plan_id": plan_id, "delta": delta}, event="chunk")
+                            else:
+                                logger.info(f"完整消息: {msg_chunk}")
+                        except Exception as e:
+                            logger.debug(f"消息流chunk解析失败: {e}")
+                            continue
+                    # 结束
+                    yield _sse_pack({"plan_id": plan_id}, event="done")
+                else:
+                    # 默认：按阶段推送
+                    async for result in graph.astream(initial_state, config):
+                        if await http_request.is_disconnected():
+                            logger.info(f"SSE client disconnected: {plan_id}")
+                            break
+
+                        stage_name = list(result.keys())[0]
+                        payload = result[stage_name]
+                        logger.info(f"[SSE] 阶段: {stage_name}")
+
+                        if stage_name == "coordinate":
+                            # 仅当coordinate节点直接产出答案(无handoff)时，才认为是简单问题并完成
+                            is_simple = False
+                            msg = None
+                            if isinstance(payload, dict) and "messages" in payload:
+                                messages_list = payload["messages"]
+                                if messages_list:
+                                    last_message = messages_list[-1]
+                                    if hasattr(last_message, "content"):
+                                        msg = last_message.content
+                                    elif isinstance(last_message, dict) and "content" in last_message:
+                                        msg = last_message["content"]
+                                    else:
+                                        msg = str(last_message)
+                                    is_simple = True if msg else False
+                            if is_simple:
+                                yield _sse_pack({"plan_id": plan_id, "message": msg, "simple": True}, event="coordinate")
+                                research_states[plan_id]["status"] = "completed"
+                                research_states[plan_id]["current_state"] = payload
+                                yield _sse_pack({"plan_id": plan_id}, event="done")
+                                break
+                            # 否则是复杂问题，后续会进入generate_plan，不在此处结束或推送coordinate事件
+                            continue
+
+                        elif stage_name == "generate_plan":
+                            # 推送计划
+                            current_plan = payload.get("current_plan") if isinstance(payload, dict) else None
+                            research_states[plan_id]["status"] = "plan_generated"
+                            research_states[plan_id]["current_state"] = payload
+                            research_states[plan_id]["current_plan"] = current_plan
+                            yield _sse_pack({
+                                "plan_id": plan_id,
+                                "current_plan": current_plan
+                            }, event="plan")
+
+                        elif stage_name == "__interrupt__":
+                            # 进入人工确认
+                            research_states[plan_id]["status"] = "awaiting_confirmation"
+                            research_states[plan_id]["current_stage"] = "human_feedback"
+                            yield _sse_pack({
+                                "plan_id": plan_id,
+                                "need_plan": True,
+                                "message": "等待用户确认研究计划"
+                            }, event="interrupt")
+                            # 中断点：等待确认，结束本次流
+                            yield _sse_pack({"plan_id": plan_id}, event="done")
+                            break
+
+                        elif stage_name == "research_node":
+                            # 推送最终研究结果
+                            research_result = payload if isinstance(payload, dict) else {}
+                            research_states[plan_id]["status"] = "completed"
+                            research_states[plan_id]["current_state"] = research_result
+                            yield _sse_pack({
+                                "plan_id": plan_id,
+                                "research_summary": research_result.get("research_summary"),
+                                "step_results": research_result.get("step_results", []),
+                            }, event="research")
+                            yield _sse_pack({"plan_id": plan_id}, event="done")
+                            break
+
+                # 结束
+            except Exception as gen_e:
+                logger.exception(f"SSE 生成器异常: {gen_e}")
+                yield _sse_pack({"plan_id": plan_id, "error": str(gen_e)}, event="error")
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"开始研究流程(SSE)失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/research/confirm-plan", response_model=ResearchStatus)
 async def confirm_plan(request: ConfirmPlan):
     """接收用户反馈，修改plan或者确认plan"""
@@ -237,6 +414,92 @@ async def confirm_plan(request: ConfirmPlan):
         
     except Exception as e:
         logger.error(f"确认研究计划失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/research/confirm-plan/stream")
+async def confirm_plan_stream(request: ConfirmPlan, http_request: Request):
+    """基于SSE的流式确认研究计划。
+    事件类型：plan / interrupt / research / done / error
+    """
+    try:
+        plan_id = request.plan_id
+        if plan_id not in research_states:
+            raise HTTPException(status_code=404, detail="研究计划不存在")
+
+        stored_state = research_states[plan_id]
+        config = stored_state["config"]
+
+        if request.user_confirm == "confirm":
+            cmd = Command(resume={"user_confirm": "confirm"})
+        elif request.user_confirm == "modify":
+            cmd = Command(resume={"user_confirm": "modify", "message": request.message})
+        else:
+            raise HTTPException(status_code=400, detail="无效的用户确认类型")
+
+        async def event_generator():
+            try:
+                # 立即反馈确认已接收
+                yield _sse_pack({"plan_id": plan_id, "ack": request.user_confirm}, event="started")
+
+                async for result in graph.astream(cmd, config):
+                    if await http_request.is_disconnected():
+                        logger.info(f"SSE client disconnected(confirm): {plan_id}")
+                        break
+
+                    stage_name = list(result.keys())[0]
+                    payload = result[stage_name]
+                    logger.info(f"[SSE-confirm] 阶段: {stage_name}")
+
+                    if stage_name == "generate_plan":
+                        current_plan = payload.get("current_plan") if isinstance(payload, dict) else None
+                        research_states[plan_id]["status"] = "plan_generated"
+                        research_states[plan_id]["current_state"] = payload
+                        research_states[plan_id]["current_plan"] = current_plan
+                        yield _sse_pack({
+                            "plan_id": plan_id,
+                            "current_plan": current_plan
+                        }, event="plan")
+
+                    elif stage_name == "__interrupt__":
+                        research_states[plan_id]["status"] = "awaiting_confirmation"
+                        research_states[plan_id]["current_stage"] = "human_feedback"
+                        yield _sse_pack({
+                            "plan_id": plan_id,
+                            "need_plan": True,
+                            "message": "等待用户确认研究计划"
+                        }, event="interrupt")
+                        yield _sse_pack({"plan_id": plan_id}, event="done")
+                        break
+
+                    elif stage_name == "research_node":
+                        research_result = payload if isinstance(payload, dict) else {}
+                        research_states[plan_id]["status"] = "completed"
+                        research_states[plan_id]["current_state"] = research_result
+                        yield _sse_pack({
+                            "plan_id": plan_id,
+                            "research_summary": research_result.get("research_summary"),
+                            "step_results": research_result.get("step_results", []),
+                        }, event="research")
+                        yield _sse_pack({"plan_id": plan_id}, event="done")
+                        break
+
+            except Exception as gen_e:
+                logger.exception(f"SSE(confirm) 生成器异常: {gen_e}")
+                yield _sse_pack({"plan_id": plan_id, "error": str(gen_e)}, event="error")
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"确认研究计划(SSE)失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/research/status/{plan_id}", response_model=ResearchStatus)

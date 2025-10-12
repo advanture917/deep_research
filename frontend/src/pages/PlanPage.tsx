@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import { useResearch, ResearchPlan } from '../context/ResearchContext';
 import { Check, Edit3, X, ArrowRight, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { confirmPlan } from '../services/researchService';
+import { confirmPlanSSE } from '../services/researchService';
 
 const PlanPage: React.FC = () => {
   const { state, dispatch } = useResearch();
@@ -51,48 +51,39 @@ const PlanPage: React.FC = () => {
   }, [state.currentPlan, state.researchTopic, state.planId, dispatch]);
 
   const handleConfirmPlan = async () => {
-    setIsLoading(true);
-    
-    try {
-      if (!state.planId) {
-        throw new Error('计划ID不存在');
-      }
-
-      // 使用研究服务确认计划
-      const result = await confirmPlan(state.planId, 'confirm');
-      
-      // 更新状态
-      dispatch({
-        type: 'UPDATE_FROM_BACKEND',
-        payload: {
-          status: result.status,
-          currentStage: result.current_stage,
-          needPlan: result.need_plan,
-          researchSummary: result.research_summary,
-          stepResults: result.step_results || [],
-          currentPlan: result.current_plan || state.currentPlan,
-        },
-      });
-
-      // 添加确认消息
-      dispatch({
-        type: 'ADD_MESSAGE',
-        payload: {
-          id: Date.now().toString(),
-          role: 'assistant',
-          content: '研究计划已确认，开始执行研究流程...',
-          timestamp: new Date(),
-        },
-      });
-
-      // 导航到进度页面
-      navigate('/progress');
-    } catch (error) {
-      console.error('确认计划失败:', error);
-      alert('确认计划失败，请稍后重试');
-    } finally {
-      setIsLoading(false);
+    if (!state.planId) {
+      alert('计划ID不存在');
+      return;
     }
+    setIsLoading(true);
+    confirmPlanSSE(state.planId, 'confirm', undefined, {
+      onStarted: () => {
+        dispatch({
+          type: 'ADD_MESSAGE',
+          payload: { id: Date.now().toString(), role: 'assistant', content: '研究计划已确认，开始执行研究流程...', timestamp: new Date() },
+        });
+        navigate('/progress');
+      },
+      onPlan: (data) => {
+        // 重新生成计划
+        dispatch({
+          type: 'UPDATE_FROM_BACKEND',
+          payload: { status: 'plan_generated', currentStage: 'generate_plan', needPlan: true, currentPlan: data?.current_plan },
+        });
+      },
+      onInterrupt: () => {
+        dispatch({ type: 'UPDATE_FROM_BACKEND', payload: { status: 'awaiting_confirmation', currentStage: 'human_feedback', needPlan: true } });
+      },
+      onResearch: (data) => {
+        dispatch({
+          type: 'UPDATE_FROM_BACKEND',
+          payload: { status: 'completed', currentStage: 'research_node', researchSummary: data?.research_summary || null, stepResults: data?.step_results || [] },
+        });
+        navigate('/report');
+      },
+      onDone: () => setIsLoading(false),
+      onError: () => setIsLoading(false),
+    });
   };
 
   const handleEditStep = (index: number, newDescription: string) => {
@@ -115,46 +106,27 @@ const PlanPage: React.FC = () => {
       alert('请输入修改意见');
       return;
     }
-
     setIsLoading(true);
-    
-    try {
-      // 使用研究服务修改计划
-      const result = await confirmPlan(state.planId, 'modify', modifyMessage);
-      
-      // 更新状态
-      dispatch({
-        type: 'UPDATE_FROM_BACKEND',
-        payload: {
-          status: result.status,
-          currentStage: result.current_stage,
-          needPlan: result.need_plan,
-          currentPlan: result.current_plan,
-          researchSummary: result.research_summary,
-          stepResults: result.step_results || [],
-        },
-      });
-
-      // 添加修改消息
-      dispatch({
-        type: 'ADD_MESSAGE',
-        payload: {
-          id: Date.now().toString(),
-          role: 'assistant',
-          content: '已收到您的修改意见，正在重新生成研究计划...',
-          timestamp: new Date(),
-        },
-      });
-
-      // 重置修改消息
-      setModifyMessage('');
-      setIsEditing(false);
-    } catch (error) {
-      console.error('修改计划失败:', error);
-      alert('修改计划失败，请稍后重试');
-    } finally {
-      setIsLoading(false);
-    }
+    confirmPlanSSE(state.planId, 'modify', modifyMessage, {
+      onStarted: () => {
+        dispatch({
+          type: 'ADD_MESSAGE',
+          payload: { id: Date.now().toString(), role: 'assistant', content: '已收到您的修改意见，正在重新生成研究计划...', timestamp: new Date() },
+        });
+      },
+      onPlan: (data) => {
+        dispatch({
+          type: 'UPDATE_FROM_BACKEND',
+          payload: { status: 'plan_generated', currentStage: 'generate_plan', needPlan: true, currentPlan: data?.current_plan },
+        });
+      },
+      onDone: () => {
+        setIsLoading(false);
+        setModifyMessage('');
+        setIsEditing(false);
+      },
+      onError: () => setIsLoading(false),
+    });
   };
 
   if (!state.currentPlan) {

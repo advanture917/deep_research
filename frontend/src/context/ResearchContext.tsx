@@ -80,6 +80,7 @@ type ResearchAction =
   | { type: 'SET_LOCALE'; payload: string }
   | { type: 'SET_PLAN'; payload: ResearchPlan }
   | { type: 'ADD_MESSAGE'; payload: Message }
+  | { type: 'UPDATE_MESSAGE_CONTENT'; payload: { id: string; content: string } }
   | { type: 'SET_LOADING'; payload: boolean }
   | { type: 'SET_CURRENT_STEP'; payload: number }
   | { type: 'UPDATE_STEP_STATUS'; payload: { stepIndex: number; status: ResearchStep['status']; result?: string } }
@@ -105,6 +106,11 @@ const researchReducer = (state: ResearchState, action: ResearchAction): Research
       return { ...state, currentPlan: action.payload };
     case 'ADD_MESSAGE':
       return { ...state, messages: [...state.messages, action.payload] };
+    case 'UPDATE_MESSAGE_CONTENT':
+      return {
+        ...state,
+        messages: state.messages.map(m => m.id === action.payload.id ? { ...m, content: action.payload.content } : m),
+      };
     case 'SET_LOADING':
       return { ...state, isLoading: action.payload };
     case 'SET_CURRENT_STEP':
